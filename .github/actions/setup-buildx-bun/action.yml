@@ -1,0 +1,82 @@
+name: Setup Docker Buildx (Bun)
+description: Set up Docker buildx for multi-platform builds using Bun
+author: stevedores-org
+
+inputs:
+  version:
+    description: 'Buildx version to install'
+    required: false
+    default: 'latest'
+  driver:
+    description: 'Buildx driver (docker-container, docker, kubernetes, remote)'
+    required: false
+    default: 'docker-container'
+  platforms:
+    description: 'Comma-separated list of platforms to support'
+    required: false
+    default: 'linux/amd64,linux/arm64'
+
+outputs:
+  buildx-version:
+    description: 'Installed buildx version'
+    value: ${{ steps.buildx-info.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Bun
+      uses: oven-sh/setup-bun@v1
+      with:
+        bun-version: latest
+
+    - name: Setup buildx with Bun
+      id: buildx-setup
+      shell: bash
+      run: |
+        set -e
+
+        # Install buildx if not present
+        if ! command -v buildx &> /dev/null; then
+          echo "Installing Docker buildx..."
+          mkdir -p ~/.docker/cli-plugins
+
+          # Download buildx binary
+          BUILDX_VERSION="${{ inputs.version }}"
+          if [ "$BUILDX_VERSION" = "latest" ]; then
+            BUILDX_VERSION=$(curl -s https://api.github.com/repos/docker/buildx/releases/latest | jq -r '.tag_name' | sed 's/v//')
+          fi
+
+          # Map `uname -m` to the names docker/buildx publishes on its
+          # release assets: linux-amd64 / linux-arm64 / linux-arm-v7.
+          # Without this, x86_64 hosts try to fetch `linux-x86_64` and 404.
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64)  ARCH=amd64 ;;
+            aarch64) ARCH=arm64 ;;
+            armv7l)  ARCH=arm-v7 ;;
+            *)
+              echo "::error::setup-buildx-bun: unsupported architecture '$ARCH'. Add a case for it or run on x86_64/aarch64/armv7l." >&2
+              exit 1
+              ;;
+          esac
+          BUILDX_URL="https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-${ARCH}"
+          echo "Downloading buildx from $BUILDX_URL"
+          curl -L "$BUILDX_URL" -o ~/.docker/cli-plugins/docker-buildx
+          chmod +x ~/.docker/cli-plugins/docker-buildx
+        fi
+
+        # Create buildx builder
+        docker buildx create --driver=${{ inputs.driver }} --name=bun-builder --use || docker buildx use bun-builder
+        docker buildx inspect --bootstrap
+
+        # Set platforms
+        docker buildx build --platform=${{ inputs.platforms }} --help > /dev/null 2>&1 || true
+
+        echo "Buildx setup complete"
+
+    - name: Get buildx info
+      id: buildx-info
+      shell: bash
+      run: |
+        VERSION=$(docker buildx version 2>/dev/null | head -1 || echo "unknown")
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT

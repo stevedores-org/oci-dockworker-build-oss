@@ -1,0 +1,162 @@
+name: Build and Push Docker Images (Bun)
+description: Build and push Docker images using Bun and Docker buildx
+author: stevedores-org
+
+inputs:
+  context:
+    description: 'Build context path'
+    required: true
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
+  image:
+    description: 'Image name/repository'
+    required: true
+  tags:
+    description: 'Comma-separated image tags'
+    required: false
+  push:
+    description: 'Push image to registry'
+    required: false
+    default: 'false'
+  platforms:
+    description: 'Target platforms (comma-separated)'
+    required: false
+    default: 'linux/amd64,linux/arm64'
+  build-args:
+    description: 'Build arguments (KEY=VALUE format, newline-separated)'
+    required: false
+  cache-from:
+    description: 'Cache source (type=registry,ref=...)'
+    required: false
+  cache-to:
+    description: 'Cache destination (type=registry,ref=...)'
+    required: false
+  sbom:
+    description: 'Enable SBOM generation'
+    required: false
+    default: 'true'
+  provenance:
+    description: 'Enable provenance attestation'
+    required: false
+    default: 'true'
+
+outputs:
+  image-digest:
+    description: 'Built image digest'
+    value: ${{ steps.build.outputs.digest }}
+  image-metadata:
+    description: 'Image metadata'
+    value: ${{ steps.build.outputs.metadata }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Bun
+      uses: oven-sh/setup-bun@v1
+      with:
+        bun-version: latest
+
+    - name: Set build variables
+      id: vars
+      shell: bash
+      run: |
+        PUSH_FLAG="${{ inputs.push }}"
+        if [ "$PUSH_FLAG" = "true" ]; then
+          PUSH_OPT="--push"
+        else
+          PUSH_OPT="--load"
+        fi
+        echo "push_opt=${PUSH_OPT}" >> $GITHUB_OUTPUT
+
+        # Parse tags
+        TAGS_STR="${{ inputs.tags }}"
+        if [ -z "$TAGS_STR" ]; then
+          TAGS_STR="${{ inputs.image }}:latest"
+        fi
+        echo "tags=${TAGS_STR}" >> $GITHUB_OUTPUT
+
+    - name: Build Docker image with buildx (Bun)
+      id: build
+      env:
+        CONTEXT: ${{ inputs.context }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        PLATFORMS: ${{ inputs.platforms }}
+        TAGS: ${{ steps.vars.outputs.tags }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+        CACHE_FROM: ${{ inputs.cache-from }}
+        CACHE_TO: ${{ inputs.cache-to }}
+        SBOM: ${{ inputs.sbom }}
+        PROVENANCE: ${{ inputs.provenance }}
+        PUSH_OPT: ${{ steps.vars.outputs.push_opt }}
+        IMAGE: ${{ inputs.image }}
+      shell: bash
+      run: |
+        set -e
+
+        # Construct buildx command in an array for safety (prevents command injection)
+        cmd_array=("docker" "buildx" "build")
+        cmd_array+=("--context" "$CONTEXT")
+        cmd_array+=("--file" "$CONTEXT/$DOCKERFILE")
+        cmd_array+=("--platform" "$PLATFORMS")
+
+        # Add tags
+        IFS=',' read -ra tag_array <<< "$TAGS"
+        for tag in "${tag_array[@]}"; do
+          cmd_array+=("--tag" "${tag// /}")
+        done
+
+        # Add build args
+        if [ -n "$BUILD_ARGS" ]; then
+          while IFS= read -r arg; do
+            if [ -n "$arg" ]; then
+              cmd_array+=("--build-arg" "$arg")
+            fi
+          done <<< "$BUILD_ARGS"
+        fi
+
+        # Add cache options
+        if [ -n "$CACHE_FROM" ]; then
+          cmd_array+=("--cache-from" "$CACHE_FROM")
+        fi
+        if [ -n "$CACHE_TO" ]; then
+          cmd_array+=("--cache-to" "$CACHE_TO")
+        fi
+
+        # Add attestations
+        if [ "$SBOM" = "true" ]; then
+          cmd_array+=("--sbom=true")
+        fi
+        if [ "$PROVENANCE" = "true" ]; then
+          cmd_array+=("--provenance=true")
+        fi
+
+        # Add push/load option
+        cmd_array+=("$PUSH_OPT")
+
+        # Add metadata output for digest extraction
+        cmd_array+=("--metadata-file" "metadata.json")
+
+        echo "Building: ${cmd_array[*]}"
+        "${cmd_array[@]}"
+
+        # Get image digest and metadata from buildx output file with error handling
+        if [ ! -f metadata.json ]; then
+          echo "ERROR: metadata.json not found"
+          exit 1
+        fi
+
+        DIGEST=$(jq -r '."containerimage.digest"' metadata.json)
+        if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+          echo "ERROR: Failed to extract image digest from metadata"
+          exit 1
+        fi
+
+        METADATA=$(cat metadata.json)
+        echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+        echo "metadata=${METADATA}" >> $GITHUB_OUTPUT
+
+        echo "Image build complete"
+        echo "Image: $IMAGE"
+        echo "Tags: $TAGS"

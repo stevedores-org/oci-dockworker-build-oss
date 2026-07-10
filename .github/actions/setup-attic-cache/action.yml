@@ -1,0 +1,38 @@
+name: Setup Attic/R2 Nix Cache
+description: Configure Attic cache and authentication for Nix builds
+
+inputs:
+  nix-cache-url:
+    description: Attic cache URL
+    required: true
+  attic-token:
+    description: Attic authentication token
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Configure Attic/R2 Cache
+      env:
+        NIX_CACHE: ${{ inputs.nix-cache-url }}
+        ATTIC_TOKEN: ${{ inputs.attic-token }}
+      shell: bash
+      run: |
+        mkdir -p ~/.config/nix
+        {
+          echo "extra-substituters = ${NIX_CACHE}"
+          echo "extra-trusted-substituters = ${NIX_CACHE}"
+          echo "netrc-file = ${HOME}/.netrc"
+        } >> ~/.config/nix/nix.conf
+
+        touch ~/.netrc
+        chmod 600 ~/.netrc
+        if [ -n "${ATTIC_TOKEN}" ]; then
+          ATTIC_DOMAIN=$(echo "${NIX_CACHE}" | sed -E 's|https?://([^/]+)/?.*|\1|')
+          cat <<EOF >> ~/.netrc
+        machine ${ATTIC_DOMAIN}
+        login ci
+        password ${ATTIC_TOKEN}
+        EOF
+        fi

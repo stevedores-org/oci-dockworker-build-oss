@@ -1,0 +1,45 @@
+name: Asset MIME smoke
+description: >
+  Run a built frontend OCI image and assert a /assets/*.js asset is served with
+  a JS Content-Type (not text/html) and not 403 — catches SPA `try_files …
+  /index.html` fallbacks that ship a broken bundle. Platform V2 E6-US1 (#2514).
+inputs:
+  image-archive:
+    description: Path to the docker-archive of the frontend image (the nix `result`).
+    required: true
+  port:
+    description: Container port the frontend listens on.
+    required: false
+    default: "8080"
+  asset-path:
+    description: Optional explicit /assets/*.js path; auto-discovered from index.html when empty.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Load image, run it, smoke /assets/*.js
+      shell: bash
+      run: |
+        set -euo pipefail
+        archive="${{ inputs.image-archive }}"
+        port="${{ inputs.port }}"
+        echo "Loading docker-archive: ${archive}"
+        load_out="$(docker load -i "${archive}")"
+        echo "${load_out}"
+        ref="$(printf '%s\n' "${load_out}" | sed -n 's/^Loaded image: //p; s/^Loaded image ID: //p' | head -n1)"
+        if [ -z "${ref}" ]; then
+          echo "::error::asset-mime-smoke: could not determine loaded image ref from docker load output"
+          exit 1
+        fi
+        cid="$(docker run -d -p "${port}:${port}" "${ref}")"
+        cleanup() { echo "--- container logs (tail) ---"; docker logs "${cid}" 2>&1 | tail -n 30 || true; docker rm -f "${cid}" >/dev/null 2>&1 || true; }
+        trap cleanup EXIT
+        echo "Waiting for origin on :${port}…"
+        up=""
+        for _ in $(seq 1 30); do
+          if curl -sf "http://localhost:${port}/" >/dev/null 2>&1; then up=1; break; fi
+          sleep 1
+        done
+        if [ -z "${up}" ]; then echo "::error::asset-mime-smoke: origin did not come up on :${port}"; exit 1; fi
+        "${GITHUB_WORKSPACE}/scripts/asset-mime-smoke.sh" "http://localhost:${port}" "${{ inputs.asset-path }}"

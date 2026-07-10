@@ -1,0 +1,4 @@
+.local-ci-cache
+
+# Rust build artifacts (propel-tools)
+/target

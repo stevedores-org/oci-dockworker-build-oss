@@ -1,0 +1,385 @@
+name: oci-build
+# Reusable OCI Image Build & Publish Workflow
+
+on:
+  workflow_call:
+    inputs:
+      dockworker-config:
+        description: "Path to dockworker.toml"
+        required: true
+        type: string
+      registry:
+        description: "Target GAR registry (e.g., ghcr.io/OWNER)"
+        required: true
+        type: string
+      dry-run:
+        description: "Dry run (no push)"
+        required: false
+        type: boolean
+        default: false
+      cache-mode:
+        description: "Attic cache mode"
+        required: false
+        type: string
+        default: "max"
+      filter-image:
+        description: "Build only this image name (satellite dispatch)"
+        required: false
+        type: string
+        default: ""
+      satellite-ref:
+        description: "Git SHA or ref for satellite repo checkout"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        required: true
+      GCP_SERVICE_ACCOUNT:
+        required: true
+      BUILDER_APP_ID:
+        # gh-bot App creds for runtime cross-org token minting (preferred).
+        required: false
+      BUILDER_PRIVATE_KEY:
+        required: false
+      SATELLITE_REPO_TOKEN:
+        # Fallback stored token for satellite builds; optional (then
+        # GITHUB_TOKEN for same-org public repos).
+        required: false
+      AWS_ROLE_TO_ASSUME:
+        # Optional ECR mirror push; skipped when unset.
+        required: false
+      AWS_REGION:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  detect-targets:
+    name: Detect Build Targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_changes: ${{ steps.set-matrix.outputs.has_changes }}
+      version: ${{ steps.meta.outputs.version }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      tags_space: ${{ steps.meta.outputs.tags_space }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version tags
+        id: meta
+        run: |
+          if [ -n "${{ inputs.satellite-ref }}" ]; then
+            REF_SHA="${{ inputs.satellite-ref }}"
+          else
+            REF_SHA="${GITHUB_SHA}"
+          fi
+          SHORT_SHA="${REF_SHA:0:7}"
+          TAGS=("sha-${SHORT_SHA}" "0.1.0")
+          if [ -n "${{ inputs.satellite-ref }}" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAGS+=("main")
+            TAGS+=("main-$(date -u +%Y%m%d%H%M%S)")
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            TAGS+=("develop")
+          fi
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAGS+=("latest")
+            TAGS+=("${GITHUB_REF_NAME#v}")
+          fi
+          echo "version=${TAGS[0]}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tags_space=${TAGS[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Get changed files (PR only)
+        id: files
+        if: github.event_name == 'pull_request'
+        run: |
+          # Fetch origin main to diff against
+          git fetch origin main --depth=1
+          CHANGED=$(git diff --name-only origin/main...HEAD)
+          # Replace newlines with spaces or print to a file
+          echo "changed_files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Detect gh-bot App creds
+        id: appcreds
+        env:
+          APP_ID: ${{ secrets.BUILDER_APP_ID }}
+          APP_PK: ${{ secrets.BUILDER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_PK" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint gh-bot token
+        if: steps.appcreds.outputs.has == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BUILDER_APP_ID }}
+          private-key: ${{ secrets.BUILDER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+          extra-conf: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Detect build matrix
+        id: set-matrix
+        env:
+          CHANGED_FILES: ${{ steps.files.outputs.changed_files }}
+          FILTER_IMAGE: ${{ inputs.filter-image }}
+        run: |
+          # Expand the caller's dockworker config into a build matrix via the
+          # propel-tools flake (was inline Python; see stevedores-org/oci-dockworker-build-oss).
+          nix run github:stevedores-org/oci-dockworker-build-oss#propel-tools -- \
+            dockworker-matrix \
+            --config "${{ inputs.dockworker-config }}" \
+            --registry "${{ inputs.registry }}" \
+            --event "${{ github.event_name }}"
+
+  build-and-push:
+    name: Build ${{ matrix.name }}
+    needs: detect-targets
+    if: needs.detect-targets.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-targets.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Detect whether gh-bot App creds are configured, so the mint step can be
+      # skipped (and the checkout falls back) where they aren't. The `secrets`
+      # context is NOT available in a job-level `env:` — it must be read inside a
+      # step (step env/run), so we surface the flag as a step output here.
+      - name: Detect gh-bot App creds
+        id: appcreds
+        env:
+          APP_ID: ${{ secrets.BUILDER_APP_ID }}
+          APP_PK: ${{ secrets.BUILDER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_PK" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Detect whether AWS ECR mirroring is configured. The `secrets` context is
+      # not available in job/step `if:` expressions in reusable workflows — read
+      # it here and gate the AWS/ECR steps on this output instead.
+      - name: Detect AWS creds
+        id: awscreds
+        env:
+          AWS_ROLE: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        run: |
+          if [ -n "$AWS_ROLE" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Satellite builds (`context = "satellite:<repo>"` in the config) live in
+      # another (private) repo. Mint a short-lived gh-bot (builder-bot) App
+      # token at runtime for cross-org read — the durable pattern, vs a stored
+      # PAT that expires. Needs BUILDER_APP_ID + BUILDER_PRIVATE_KEY as
+      # Actions secrets (same App creds already in GSM/your secrets manager).
+      - name: Mint gh-bot token
+        if: steps.appcreds.outputs.has == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BUILDER_APP_ID }}
+          private-key: ${{ secrets.BUILDER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # Check out the satellite repo under ./satellite-repo so the build runs
+      # against its flake. Prefer the freshly minted App token; fall back to a
+      # stored SATELLITE_REPO_TOKEN, then GITHUB_TOKEN (same-org public only).
+      - name: Checkout satellite repo
+        if: matrix.repo != ''
+        uses: actions/checkout@v4
+        with:
+          repository: your-org/${{ matrix.repo }}
+          ref: ${{ inputs.satellite-ref || '' }}
+          path: satellite-repo
+          token: ${{ steps.app-token.outputs.token || secrets.SATELLITE_REPO_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # Resolve where the bun build, the nix build, and the dist output live.
+      # All of `bun_dir` / `subdir` / `dist_dir` are relative to the build root
+      # (the satellite checkout, or this repo for local `context` builds).
+      - name: Resolve build directories
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.repo }}" ]; then
+            BASE="satellite-repo"
+          else
+            BASE="${{ matrix.context }}"
+            [ -z "$BASE" ] && BASE="."
+          fi
+          NIX_DIR="$BASE"; [ -n "${{ matrix.subdir }}" ] && NIX_DIR="$BASE/${{ matrix.subdir }}"
+          BUN_DIR="$BASE"; [ -n "${{ matrix.bun_dir }}" ] && BUN_DIR="$BASE/${{ matrix.bun_dir }}"
+          {
+            echo "NIX_DIR=$NIX_DIR"
+            echo "BUN_DIR=$BUN_DIR"
+          } >> "$GITHUB_ENV"
+          if [ -n "${{ matrix.dist_dir }}" ]; then
+            echo "DIST_ABS=$(pwd)/$BASE/${{ matrix.dist_dir }}" >> "$GITHUB_ENV"
+          fi
+          echo "Build dirs: NIX_DIR=$NIX_DIR BUN_DIR=$BUN_DIR"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+          extra-conf: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Install Bun
+        # If we have a package.json or bun.lock in the bun dir, setup Bun
+        run: |
+          if [ -f "${BUN_DIR}/package.json" ] || [ -f "${BUN_DIR}/bun.lock" ]; then
+            echo "SETUP_BUN=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Bun
+        if: env.SETUP_BUN == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build frontend assets
+        if: env.SETUP_BUN == 'true'
+        working-directory: ${{ env.BUN_DIR }}
+        run: |
+          if [ -f "package.json" ]; then
+            INSTALL_COMMAND="${{ matrix.install_command }}"
+            BUILD_COMMAND="${{ matrix.build_command }}"
+            if [ -n "$INSTALL_COMMAND" ]; then
+              bash -lc "$INSTALL_COMMAND"
+            else
+              bun install --frozen-lockfile
+            fi
+            if [ -n "$BUILD_COMMAND" ]; then
+              bash -lc "$BUILD_COMMAND"
+            elif jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+              bun run build
+            else
+              echo "No build script found in package.json, skipping build step."
+            fi
+          fi
+
+      - name: Check if Nix target exists
+        id: check-target
+        working-directory: ${{ env.NIX_DIR }}
+        run: |
+          set -euo pipefail
+          SYSTEM=$(nix eval --raw 'nixpkgs#system' 2>/dev/null || echo "x86_64-linux")
+          if nix eval --raw ".#${{ matrix.nix_output }}.name" --impure; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Nix target '.#${{ matrix.nix_output }}' exists for system $SYSTEM."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Nix target '.#${{ matrix.nix_output }}' does not exist for system $SYSTEM. Skipping Nix build."
+          fi
+
+      - name: Build OCI image with Nix
+        if: steps.check-target.outputs.exists == 'true'
+        working-directory: ${{ env.NIX_DIR }}
+        run: |
+          set -euo pipefail
+          # Point the flake at freshly built frontend assets, if any. DIST_ABS is
+          # an absolute path resolved in "Resolve build directories".
+          if [ -n "${DIST_ABS:-}" ] && [ -d "$DIST_ABS" ]; then
+            export NIX_HITL_DIST="$DIST_ABS"
+          elif [ -d "dist" ]; then
+            export NIX_HITL_DIST="$PWD/dist"
+          fi
+          nix build ".#${{ matrix.nix_output }}" -L --impure
+
+          # Find tarball output
+          RESULT_DIR=$(readlink -f result)
+          IMAGE_TARBALL=$(find "$RESULT_DIR" -maxdepth 1 -type f -name "*.tar*" | head -1)
+          if [ -z "$IMAGE_TARBALL" ]; then
+            echo "ERROR: No tarball found in nix build output at $RESULT_DIR" >&2
+            ls -la "$RESULT_DIR"
+            exit 1
+          fi
+          echo "IMAGE_TARBALL=$IMAGE_TARBALL" >> "$GITHUB_ENV"
+
+      - name: Google Cloud Auth (OIDC)
+        if: github.event_name != 'pull_request' && inputs.dry-run == false && steps.check-target.outputs.exists == 'true'
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 1800s
+
+      - name: Push to Google Artifact Registry (GAR)
+        if: github.event_name != 'pull_request' && inputs.dry-run == false && steps.gcp-auth.outputs.access_token != '' && steps.check-target.outputs.exists == 'true'
+        env:
+          GCP_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
+          GAR_IMAGE: ${{ matrix.gar_image }}
+          TAGS_SPACE: ${{ needs.detect-targets.outputs.tags_space }}
+        run: |
+          which skopeo || (sudo apt-get update && sudo apt-get install -y skopeo)
+
+          for TAG in $TAGS_SPACE; do
+            echo "Pushing $GAR_IMAGE:$TAG to GAR..."
+            skopeo copy \
+              --dest-creds="oauth2accesstoken:$GCP_ACCESS_TOKEN" \
+              docker-archive:"$IMAGE_TARBALL" \
+              "docker://$GAR_IMAGE:$TAG"
+          done
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request' && inputs.dry-run == false && steps.check-target.outputs.exists == 'true' && steps.awscreds.outputs.has == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Login to Amazon ECR
+        if: github.event_name != 'pull_request' && inputs.dry-run == false && steps.check-target.outputs.exists == 'true' && steps.awscreds.outputs.has == 'true'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push to Amazon ECR
+        if: github.event_name != 'pull_request' && inputs.dry-run == false && steps.check-target.outputs.exists == 'true' && steps.awscreds.outputs.has == 'true' && steps.login-ecr.outputs.registry != ''
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ matrix.image }}
+          TAGS_SPACE: ${{ needs.detect-targets.outputs.tags_space }}
+        run: |
+          for TAG in $TAGS_SPACE; do
+            echo "Pushing $ECR_REGISTRY/$ECR_REPOSITORY:$TAG to ECR..."
+            skopeo copy \
+              docker-archive:"$IMAGE_TARBALL" \
+              "docker://$ECR_REGISTRY/$ECR_REPOSITORY:$TAG"
+          done
+
+
+      - name: Smoke test (PR only)
+        if: github.event_name == 'pull_request' && steps.check-target.outputs.exists == 'true'
+        run: |
+          docker load < "$IMAGE_TARBALL"
+          docker run --rm "${{ matrix.image }}:latest" --version || true
+          echo "✓ Image loads and runs"

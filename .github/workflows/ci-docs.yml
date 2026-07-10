@@ -1,0 +1,45 @@
+---
+name: ci-docs
+
+'on':
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - specs/**
+      - standards/**
+      - policies/**
+      - templates/**
+      - '**/*.md'
+      - '**/*.mdx'
+  pull_request:
+    paths:
+      - docs/**
+      - specs/**
+      - standards/**
+      - policies/**
+      - templates/**
+      - '**/*.md'
+      - '**/*.mdx'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-docs:
+    name: Validate Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Validate documentation (TypeScript)
+        env:
+          DOCS_PATHS: "docs specs standards policies templates"
+        run: bun run .github/scripts/validate-docs.ts
