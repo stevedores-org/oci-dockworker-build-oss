@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       registry:
-        description: "Target GAR registry (e.g., ghcr.io/OWNER)"
+        description: "Target container registry (e.g., ghcr.io/OWNER, GAR, or ECR)"
         required: true
         type: string
       dry-run:
